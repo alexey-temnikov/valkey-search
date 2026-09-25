@@ -363,22 +363,7 @@ void PerformSortingOnRelevantPortion(std::vector<indexes::Neighbor> &neighbors,
 // Apply sorting to neighbors based on attribute values in attribute_contents
 void ApplySorting(std::vector<indexes::Neighbor> &neighbors,
                   const SearchCommand &parameters) {
-  if (neighbors.empty()) {
-    return;
-  }
-
-  // Default sort for a standalone VR query: ascending distance, then key.
-  // Guarded on IsStandaloneVectorRange so VR+text keeps the BM-25 order set by
-  // TrimResults (which the NOCONTENT early path also preserves).
-  if (!parameters.sortby_parameter.has_value()) {
-    if (query::IsStandaloneVectorRange(parameters)) {
-      auto default_compare = [](const indexes::Neighbor &a,
-                                const indexes::Neighbor &b) -> bool {
-        if (a.distance != b.distance) return a.distance < b.distance;
-        return a.external_id->Str() < b.external_id->Str();
-      };
-      PerformSortingOnRelevantPortion(neighbors, parameters, default_compare);
-    }
+  if (!parameters.sortby_parameter.has_value() || neighbors.empty()) {
     return;
   }
 
@@ -405,7 +390,8 @@ void ApplySorting(std::vector<indexes::Neighbor> &neighbors,
       if (a.distance > b.distance) {
         return sortby.order == query::SortOrder::kDescending;
       }
-      return false;
+      // Tie-break on key ascending for a deterministic order.
+      return a.external_id->Str() < b.external_id->Str();
     };
     PerformSortingOnRelevantPortion(neighbors, parameters, distance_compare);
     return;

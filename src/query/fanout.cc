@@ -159,7 +159,8 @@ struct SearchPartitionResultsTracker {
           neighbor_entry->distance(), std::move(attribute_contents)};
       // Single-VR model: the VR distance is carried in Neighbor::distance
       // above. Cluster merge concatenates per-shard in-radius neighbors; the
-      // caller re-sorts by ascending distance. No score-slot side channel.
+      // merged set is ordered like any non-vector result. No score-slot side
+      // channel.
       neighbor.score = neighbor_entry->score();
       AddResult(neighbor);
     }
