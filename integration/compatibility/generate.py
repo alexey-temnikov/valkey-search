@@ -219,7 +219,7 @@ class TestAggregateCompatibility(BaseCompatibilityTest):
 
     def checkrange(self, dialect, *orig_cmd, radius=1.0,
                    query_vector=[0] * VECTOR_DIM, field="v1",
-                   extra_params="", query_attrs=None, negate=False):
+                   extra_params="", query_attrs=None, negate=False, filter=""):
         """Build and execute a VECTOR_RANGE query.
 
         The first ``*`` in *orig_cmd* is replaced with the range clause.
@@ -227,6 +227,9 @@ class TestAggregateCompatibility(BaseCompatibilityTest):
         ``query_attrs`` can be e.g. ``"{$yield_distance_as: dist}"`` and will
         be appended as a suffix after the ``]`` in the range clause.
         ``negate`` prepends ``-`` to the range clause.
+        ``filter`` is appended to the range clause in the same query argument,
+        e.g. ``"@n1:[0 +inf]"`` or ``"| @t3:{x}"``; a single-string
+        *orig_cmd* is split on whitespace, so it can't carry the filter.
         """
         cmd = orig_cmd[0].split() if len(orig_cmd) == 1 else [*orig_cmd]
         range_clause = f"@{field}:[VECTOR_RANGE $RADIUS $BLOB {extra_params}]".strip()
@@ -234,6 +237,8 @@ class TestAggregateCompatibility(BaseCompatibilityTest):
             range_clause = f"{range_clause}=>{query_attrs}"
         if negate:
             range_clause = f"-{range_clause}"
+        if filter:
+            range_clause = f"{range_clause} {filter}"
         new_cmd = []
         did_one = False
         for c in cmd:
@@ -249,6 +254,9 @@ class TestAggregateCompatibility(BaseCompatibilityTest):
             "DIALECT", str(dialect),
         ]
         self.execute_command(new_cmd)
+        # compatibility_test.py passes any answer where Redis raised without
+        # comparing it, so a rejected query would silently test nothing.
+        assert not self.answers[-1]["exception"], f"Redis rejected {new_cmd}"
 
     def checkvec(self, dialect, *orig_cmd, knn=10000, score_as="", query_vector=[0] * VECTOR_DIM):
         '''Check vector queries only.'''
@@ -1104,7 +1112,9 @@ class TestAggregateCompatibility(BaseCompatibilityTest):
         self.setup_data(f"vector data {metric} {algo}", key_type)
         vector_points = [-.75, .75]
         radii = [0, 0.5, 2.0, 100.0]
-        epsilons = [None, 0.0, 0.1]
+        # Redis rejects $epsilon on FLAT and $epsilon 0, and a rejected query
+        # is never compared.
+        epsilons = [None, 0.1] if algo == "hnsw" else [None]
         for x in vector_points:
             for y in vector_points:
                 for z in vector_points:
@@ -1135,11 +1145,12 @@ class TestAggregateCompatibility(BaseCompatibilityTest):
     def test_vector_range_and_numeric(self, key_type, dialect, vector_data_type):
         """VECTOR_RANGE combined with numeric filter via AND."""
         self.setup_data("sortable numbers", key_type)
-        for r in [5.0, 50.0]:
+        # 200 is the first radius whose matches (docs 00-08) overlap n1 >= 0.
+        for r in [5.0, 50.0, 200.0]:
             self.checkrange(
                 dialect,
-                f"ft.search {key_type}_idx1 * @n1:[0 +inf] NOCONTENT",
-                radius=r,
+                f"ft.search {key_type}_idx1 * NOCONTENT",
+                radius=r, filter="@n1:[0 +inf]",
             )
 
     def test_vector_range_and_tag(self, key_type, dialect, vector_data_type):
@@ -1147,8 +1158,8 @@ class TestAggregateCompatibility(BaseCompatibilityTest):
         self.setup_data("sortable numbers", key_type)
         self.checkrange(
             dialect,
-            f"ft.search {key_type}_idx1 * @t3:{{all_the_same_value}} NOCONTENT",
-            radius=50,
+            f"ft.search {key_type}_idx1 * NOCONTENT",
+            radius=50, filter="@t3:{all_the_same_value}",
         )
 
     def test_vector_range_or_numeric(self, key_type, dialect, vector_data_type):
@@ -1156,8 +1167,8 @@ class TestAggregateCompatibility(BaseCompatibilityTest):
         self.setup_data("sortable numbers", key_type)
         self.checkrange(
             dialect,
-            f"ft.search {key_type}_idx1 * | @n1:[0 +inf] NOCONTENT",
-            radius=1,
+            f"ft.search {key_type}_idx1 * NOCONTENT",
+            radius=1, filter="| @n1:[0 +inf]",
         )
 
     def test_vector_range_negate(self, key_type, dialect, vector_data_type):
@@ -1183,40 +1194,41 @@ class TestAggregateCompatibility(BaseCompatibilityTest):
         for r in [1.0, 5.0, 50.0]:
             self.checkrange(
                 dialect,
-                f"ft.search {key_type}_idx1 * | @t3:{{all_the_same_value}} NOCONTENT",
-                radius=r,
+                f"ft.search {key_type}_idx1 * NOCONTENT",
+                radius=r, filter="| @t3:{all_the_same_value}",
             )
         for r in [1.0, 5.0]:
+            # '.' is escaped: Redis matches nothing for @t1:{one.one0}.
             self.checkrange(
                 dialect,
-                f"ft.search {key_type}_idx1 * | @t1:{{one.one0}} NOCONTENT",
-                radius=r,
+                f"ft.search {key_type}_idx1 * NOCONTENT",
+                radius=r, filter=r"| @t1:{one\.one0}",
             )
         # VR OR numeric with varying radii
         for r in [0.0, 0.5, 1.0, 5.0, 50.0, 100.0]:
             self.checkrange(
                 dialect,
-                f"ft.search {key_type}_idx1 * | @n1:[0 +inf] NOCONTENT",
-                radius=r,
+                f"ft.search {key_type}_idx1 * NOCONTENT",
+                radius=r, filter="| @n1:[0 +inf]",
             )
         # VR OR empty numeric — result is purely VR matches
         for r in [1.0, 5.0]:
             self.checkrange(
                 dialect,
-                f"ft.search {key_type}_idx1 * | @n1:[999 1000] NOCONTENT",
-                radius=r,
+                f"ft.search {key_type}_idx1 * NOCONTENT",
+                radius=r, filter="| @n1:[999 1000]",
             )
         # VR OR negated numeric
         for r in [1.0, 5.0, 50.0]:
             self.checkrange(
                 dialect,
-                f"ft.search {key_type}_idx1 * | -@n1:[0 +inf] NOCONTENT",
-                radius=r,
+                f"ft.search {key_type}_idx1 * NOCONTENT",
+                radius=r, filter="| -@n1:[0 +inf]",
             )
         self.checkrange(
             dialect,
-            f"ft.search {key_type}_idx1 * | -@n1:[999 1000] NOCONTENT",
-            radius=5.0,
+            f"ft.search {key_type}_idx1 * NOCONTENT",
+            radius=5.0, filter="| -@n1:[999 1000]",
         )
 
     def test_vector_range_negate_and(self, key_type, dialect, vector_data_type):
@@ -1226,25 +1238,25 @@ class TestAggregateCompatibility(BaseCompatibilityTest):
         for r in [1.0, 5.0, 50.0]:
             self.checkrange(
                 dialect,
-                f"ft.search {key_type}_idx1 * @n1:[0 +inf] NOCONTENT",
-                radius=r, negate=True,
+                f"ft.search {key_type}_idx1 * NOCONTENT",
+                radius=r, negate=True, filter="@n1:[0 +inf]",
             )
         self.checkrange(
             dialect,
-            f"ft.search {key_type}_idx1 * @n1:[3 5] NOCONTENT",
-            radius=5.0, negate=True,
+            f"ft.search {key_type}_idx1 * NOCONTENT",
+            radius=5.0, negate=True, filter="@n1:[3 5]",
         )
         # Negated VR AND tag
         for r in [1.0, 5.0, 50.0]:
             self.checkrange(
                 dialect,
-                f"ft.search {key_type}_idx1 * @t3:{{all_the_same_value}} NOCONTENT",
-                radius=r, negate=True,
+                f"ft.search {key_type}_idx1 * NOCONTENT",
+                radius=r, negate=True, filter="@t3:{all_the_same_value}",
             )
         self.checkrange(
             dialect,
-            f"ft.search {key_type}_idx1 * @t1:{{one.one0}} NOCONTENT",
-            radius=5.0, negate=True,
+            f"ft.search {key_type}_idx1 * NOCONTENT",
+            radius=5.0, negate=True, filter=r"@t1:{one\.one0}",
         )
 
     def test_vector_range_negate_or(self, key_type, dialect, vector_data_type):
@@ -1254,26 +1266,26 @@ class TestAggregateCompatibility(BaseCompatibilityTest):
         for r in [1.0, 5.0, 50.0]:
             self.checkrange(
                 dialect,
-                f"ft.search {key_type}_idx1 * | @n1:[0 +inf] NOCONTENT",
-                radius=r, negate=True,
+                f"ft.search {key_type}_idx1 * NOCONTENT",
+                radius=r, negate=True, filter="| @n1:[0 +inf]",
             )
         for r in [1.0, 5.0]:
             self.checkrange(
                 dialect,
-                f"ft.search {key_type}_idx1 * | @n1:[999 1000] NOCONTENT",
-                radius=r, negate=True,
+                f"ft.search {key_type}_idx1 * NOCONTENT",
+                radius=r, negate=True, filter="| @n1:[999 1000]",
             )
         # Negated VR OR tag
         for r in [1.0, 5.0, 50.0]:
             self.checkrange(
                 dialect,
-                f"ft.search {key_type}_idx1 * | @t3:{{all_the_same_value}} NOCONTENT",
-                radius=r, negate=True,
+                f"ft.search {key_type}_idx1 * NOCONTENT",
+                radius=r, negate=True, filter="| @t3:{all_the_same_value}",
             )
         self.checkrange(
             dialect,
-            f"ft.search {key_type}_idx1 * | @t1:{{one.one0}} NOCONTENT",
-            radius=5.0, negate=True,
+            f"ft.search {key_type}_idx1 * NOCONTENT",
+            radius=5.0, negate=True, filter=r"| @t1:{one\.one0}",
         )
 
     def test_vector_range_sortby(self, key_type, dialect, vector_data_type):
