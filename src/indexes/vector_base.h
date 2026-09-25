@@ -206,6 +206,19 @@ struct Neighbor {
   }
 };
 
+// Neighbor::distance marker for a VECTOR_RANGE compound result without a VR
+// distance: a doc outside the radius that matched through a non-VR OR branch
+// (or a negated VR). It is the largest finite float, so it sorts after every
+// real distance, and it is compared exactly. It is not an infinity: the module
+// is built with -ffast-math (-ffinite-math-only), which lets the compiler
+// assume no infinities; GCC compiled an infinity marker to FLT_MAX, so the
+// infinity checks never fired.
+inline constexpr float kNoVrDistance = std::numeric_limits<float>::max();
+
+inline bool HasVrDistance(const Neighbor &neighbor) {
+  return neighbor.distance != kNoVrDistance;
+}
+
 const absl::NoDestructor<absl::flat_hash_map<
     absl::string_view, data_model::VectorIndex::AlgorithmCase>>
     kVectorAlgoByStr({

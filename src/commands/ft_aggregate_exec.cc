@@ -23,7 +23,6 @@
 #include "src/attribute_data_type.h"
 #include "src/commands/ft_aggregate_parser.h"
 #include "src/indexes/index_base.h"
-#include "src/indexes/scoring/scorer.h"
 #include "src/query/response_generator.h"
 #include "src/valkey_search_options.h"
 #include "vmsdk/src/debug.h"
@@ -1186,14 +1185,9 @@ absl::Status CreateRecordsFromNeighbors(
 
     // Write the single VR distance into its registered record attribute slot.
     // In the single-VR model the matched distance is carried in
-    // Neighbor::distance; a non-VR OR-branch match has distance == +infinity
-    // (no VR distance) and is omitted. IsInf (bit-pattern check) rather than
-    // `!= infinity()`: the build uses -ffast-math (-ffinite-math-only), under
-    // which the compiler assumes no infinities and folds the direct comparison
-    // to a constant, defeating the guard. Same reason ft_search.cc routes this
-    // through HasVrDistance().
-    if (!parameters.vr_score_field_name_.empty() &&
-        !indexes::scoring::IsInf(n.distance)) {
+    // Neighbor::distance; a non-VR OR-branch match has distance ==
+    // kNoVrDistance (no VR distance) and is omitted.
+    if (!parameters.vr_score_field_name_.empty() && indexes::HasVrDistance(n)) {
       auto it = parameters.record_indexes_by_alias_.find(
           parameters.vr_score_field_name_);
       if (it != parameters.record_indexes_by_alias_.end()) {

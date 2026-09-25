@@ -22,7 +22,6 @@
 #include "src/commands/commands.h"
 #include "src/commands/ft_search_parser.h"
 #include "src/indexes/index_base.h"
-#include "src/indexes/scoring/scorer.h"
 #include "src/indexes/vector_base.h"
 #include "src/metrics.h"
 #include "src/query/response_generator.h"
@@ -36,16 +35,6 @@
 namespace valkey_search {
 
 namespace {
-// A standalone/compound VR neighbor carries its distance in Neighbor::distance.
-// Non-VR OR-branch matches use +infinity as a sentinel meaning "no VR distance"
-// (see SearchVectorRangeQuery). IsInf (bit-pattern check) rather than
-// `!= infinity()`: the build uses -ffast-math (-ffinite-math-only), under which
-// the compiler assumes no infinities and folds the direct comparison to a
-// constant, defeating the sentinel.
-inline bool HasVrDistance(const indexes::Neighbor &neighbor) {
-  return !indexes::scoring::IsInf(neighbor.distance);
-}
-
 // FT.SEARCH idx "*=>[KNN 10 @vec $BLOB AS score]" PARAMS 2 BLOB
 // "\x12\xa9\xf5\x6c" DIALECT 2
 
@@ -109,27 +98,6 @@ void ReplyScoreTopLevel(ValkeyModuleCtx *ctx, float score) {
 
 std::string GetSortKeyValue(const indexes::Neighbor &neighbor,
                             const SearchCommand &command);
-
-// If the SORTBY field matches the VR distance alias, returns the formatted
-// distance for this neighbor (to be emitted with the numeric '#' prefix for
-// WITHSORTKEYS). Returns std::nullopt when the SORTBY field is not the VR
-// alias or the neighbor has no VR distance (distance is +infinity for non-VR
-// OR-branch matches), so callers fall back to GetSortKeyValue(). vr_field is
-// the single VR score field name (empty when the query has no VR predicate).
-std::optional<std::string> GetVrSortKeyValue(const indexes::Neighbor &neighbor,
-                                             const SearchCommand &command,
-                                             const std::string &vr_field) {
-  if (!command.sortby_parameter.has_value()) {
-    return std::nullopt;
-  }
-  if (vr_field.empty() || vr_field != command.sortby_parameter->field) {
-    return std::nullopt;
-  }
-  if (!HasVrDistance(neighbor)) {
-    return std::nullopt;
-  }
-  return absl::StrFormat("%.12g", neighbor.distance);
-}
 
 // WITHSORTKEYS prefixes each sort key by the SORTBY field's declared type:
 // '#' for NUMERIC fields, '$' for everything else (RediSearch-compatible).
@@ -265,6 +233,11 @@ void SerializeNonVectorNeighbors(ValkeyModuleCtx *ctx,
   if (command.IsVectorRangeQuery()) {
     vr_field = query::GetVrScoreFieldName(command);
   }
+  // A SORTBY on the VR distance alias sorts by Neighbor::distance, which is not
+  // in attribute_contents.
+  const bool sort_by_vr_distance = !vr_field.empty() &&
+                                   command.sortby_parameter.has_value() &&
+                                   command.sortby_parameter->field == vr_field;
 
   // When with_sort_keys is true, we add an extra element per result (the sort
   // key)
@@ -302,32 +275,30 @@ void SerializeNonVectorNeighbors(ValkeyModuleCtx *ctx,
     }
 
     // Prefix the sort key: '#' for NUMERIC fields, '$' for string fields
-    // (RediSearch-compatible). A SORTBY on the VR distance alias must emit the
-    // formatted distance (Neighbor::distance) with the numeric '#' prefix; it
-    // is not in attribute_contents, so GetSortKeyValue() would return "".
+    // (RediSearch-compatible). A SORTBY on the VR distance alias emits the
+    // formatted Neighbor::distance with the numeric '#' prefix, or nil (as
+    // Redisearch does) when the neighbor has no VR distance; it never falls
+    // back to a stored attribute of the same name.
     if (command.with_sort_keys) {
-      std::optional<std::string> vr_value =
-          GetVrSortKeyValue(neighbors[i], command, vr_field);
-      std::string sort_key_value;
-      std::string prefix;
-      if (vr_value.has_value()) {
-        sort_key_value = *vr_value;
-        prefix = "#";
+      if (sort_by_vr_distance && !indexes::HasVrDistance(neighbors[i])) {
+        ValkeyModule_ReplyWithNull(ctx);
       } else {
-        sort_key_value = GetSortKeyValue(neighbors[i], command);
-        prefix = prefix_str;
+        std::string value_with_prefix =
+            sort_by_vr_distance
+                ? "#" + absl::StrFormat("%.12g", neighbors[i].distance)
+                : prefix_str + GetSortKeyValue(neighbors[i], command);
+        ValkeyModule_ReplyWithString(
+            ctx, vmsdk::MakeUniqueValkeyString(value_with_prefix).get());
       }
-      std::string value_with_prefix = prefix + sort_key_value;
-      ValkeyModule_ReplyWithString(
-          ctx, vmsdk::MakeUniqueValkeyString(value_with_prefix).get());
     }
 
     const auto &contents = neighbors[i].attribute_contents.value();
 
     // The single VR distance field is emitted when this is a VR query and the
     // neighbor carries a VR distance (a genuine in-radius match, not a non-VR
-    // OR-branch match whose distance is +infinity).
-    const bool emit_vr_field = !vr_field.empty() && HasVrDistance(neighbors[i]);
+    // OR-branch match whose distance is kNoVrDistance).
+    const bool emit_vr_field =
+        !vr_field.empty() && indexes::HasVrDistance(neighbors[i]);
 
     if (command.return_attributes.empty()) {
       size_t array_size = 2 * contents.size() + (emit_vr_field ? 2 : 0);
@@ -352,7 +323,7 @@ void SerializeNonVectorNeighbors(ValkeyModuleCtx *ctx,
         absl::string_view ret_id =
             vmsdk::ToStringView(return_attribute.identifier.get());
         if (!vr_field.empty() && ret_id == vr_field) {
-          if (HasVrDistance(neighbors[i])) {
+          if (indexes::HasVrDistance(neighbors[i])) {
             ValkeyModule_ReplyWithString(ctx, return_attribute.alias.get());
             auto score_value = absl::StrFormat("%.12g", neighbors[i].distance);
             ValkeyModule_ReplyWithString(
@@ -421,10 +392,10 @@ void ApplySorting(std::vector<indexes::Neighbor> &neighbors,
     auto distance_compare = [&](const indexes::Neighbor &a,
                                 const indexes::Neighbor &b) -> bool {
       // A neighbor that did not match the VR predicate (tag-only branch of a
-      // compound OR) has distance == +infinity and must sort after all
+      // compound OR) has distance == kNoVrDistance and must sort after all
       // matched neighbors, in both ascending and descending order.
-      const bool a_unmatched = !HasVrDistance(a);
-      const bool b_unmatched = !HasVrDistance(b);
+      const bool a_unmatched = !indexes::HasVrDistance(a);
+      const bool b_unmatched = !indexes::HasVrDistance(b);
       if (a_unmatched || b_unmatched) {
         return !a_unmatched && b_unmatched;
       }

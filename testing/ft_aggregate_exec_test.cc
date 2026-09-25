@@ -658,15 +658,14 @@ TEST_F(CreateRecordsFromNeighborsTest, SingleVrDistancePopulated) {
                   1.5f);
 }
 
-// A non-VR OR-branch match carries distance == +infinity, meaning "no VR
+// A non-VR OR-branch match carries distance == kNoVrDistance, meaning "no VR
 // distance"; the VR record field is left nil.
 TEST_F(CreateRecordsFromNeighborsTest, UnmatchedVrLeavesFieldNil) {
   auto params = MakeParams("__score", "d1");
   // index layout: 0=__key, 1=__score, 2=d1
 
   std::vector<indexes::Neighbor> neighbors;
-  neighbors.push_back(
-      MakeNeighbor("k1", std::numeric_limits<float>::infinity()));
+  neighbors.push_back(MakeNeighbor("k1", indexes::kNoVrDistance));
 
   RecordSet records(params.get());
   VMSDK_EXPECT_OK(

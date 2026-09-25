@@ -15,7 +15,6 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
-#include <limits>
 #include <memory>
 #include <optional>
 #include <queue>
@@ -896,7 +895,7 @@ absl::StatusOr<std::vector<indexes::Neighbor>> SearchVectorRangeQuery(
         // this key: Redisearch yields the distance for every returned doc that
         // lies within the radius, regardless of which branch matched. A key
         // that is outside the radius (or not tracked in the vector index) gets
-        // +infinity so it sorts after all genuine VR matches and carries no
+        // kNoVrDistance so it sorts after all genuine VR matches and carries no
         // yielded distance — matching a text-only match with no vdist.
         float distance;
         if (eval_result.HasVrScore()) {
@@ -907,9 +906,9 @@ absl::StatusOr<std::vector<indexes::Neighbor>> SearchVectorRangeQuery(
               static_cast<float>(vr_predicate->GetRadius()));
           distance = (within.ok() && within->has_value())
                          ? within->value()
-                         : std::numeric_limits<float>::infinity();
+                         : indexes::kNoVrDistance;
         } else {
-          distance = std::numeric_limits<float>::infinity();
+          distance = indexes::kNoVrDistance;
         }
         neighbors.emplace_back(key, distance);
         if (needs_dedup) {
