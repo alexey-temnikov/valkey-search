@@ -52,9 +52,6 @@ namespace valkey_search::indexes {
 
 constexpr float kDefaultMagnitude = 1.0f;
 
-std::vector<char> NormalizeEmbedding(absl::string_view record, size_t type_size,
-                                     float *magnitude = nullptr);
-
 class VectorRecord {
  public:
   // Disallow copy and move because it is variable-sized and should only be
@@ -159,7 +156,6 @@ struct Neighbor {
   float score;
   uint64_t sequence_number;
   std::optional<RecordsMap> attribute_contents;
-
   Neighbor() : distance(0.0f), score(kDefaultScore), sequence_number(0) {}
   Neighbor(const InternedStringPtr &external_id, float distance)
       : external_id(external_id),
@@ -311,10 +307,6 @@ class VectorBase : public IndexBase {
   bool AddPrefilteredKey(
       absl::string_view query, float query_magnitude,
       const InternedStringPtr &key, uint64_t count,
-      std::priority_queue<std::pair<float, hnswlib::labeltype>> &results,
-      absl::flat_hash_set<const char *> &top_keys) const;
-  bool AddPrefilteredKey(
-      absl::string_view query, uint64_t count, const InternedStringPtr &key,
       std::priority_queue<std::pair<float, hnswlib::labeltype>> &results,
       absl::flat_hash_set<const char *> &top_keys) const;
   template <typename T>
@@ -485,10 +477,6 @@ class VectorBase : public IndexBase {
     if (dist >= 2.0f - kClampEpsilon) return std::nextafter(2.0f, 3.0f);
     return dist;
   }
-
-  template <typename T>
-  void Init(int dimensions, data_model::DistanceMetric distance_metric,
-            std::unique_ptr<hnswlib::SpaceInterface<T>> &space);
 
   virtual absl::Status AddRecordImpl(
       uint64_t internal_id,

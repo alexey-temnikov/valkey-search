@@ -979,6 +979,8 @@ struct ResolvedLeaf {
   // path takes the first posting containing the key in a requested field while
   // the in-iterator path (TermIterator::per_term_idf_) takes the merge heap's
   // front, which InsertValidKeyIterator already field-filtered.
+  // Inline capacity stays small: ResolvedLeaf is a by-value hash-map payload
+  // shared with term/tag leaves, so 200 slots would cost ~3.2 KB per leaf.
   // Expansions never stem, so `field_mask` gates every entry.
   struct ExpansionTerm {
     indexes::text::InvasivePtr<indexes::text::Postings> postings;
@@ -988,8 +990,8 @@ struct ResolvedLeaf {
 };
 
 // Keyed on the base Predicate* (not TermPredicate*) so the per-document scoring
-// walk can look leaves up without a dynamic_cast: a hit is a scored term leaf,
-// a miss is a non-scored text predicate (prefix/suffix/fuzzy).
+// walk can look leaves up without a dynamic_cast: a hit is a scored leaf, a
+// miss is a leaf that resolved to nothing scoreable.
 using ResolvedLeaves = absl::flat_hash_map<const Predicate *, ResolvedLeaf>;
 
 // Collapses an all-fields mask (what the parser builds for an unscoped query)
@@ -1022,13 +1024,14 @@ void AddExpansionTerm(
 //   - the posting lists (the expensive radix-tree lookup + stem expansion),
 //   - the document frequency (dt), and
 //   - the per-term BM25 weight (IDF).
-// It also performs the one dynamic_cast needed to tell scored TermPredicates
-// apart from non-scored text predicates (prefix/suffix/fuzzy) here, so the
-// per-document walk can distinguish them with a cheap map lookup instead.
+// It also performs the dynamic_casts needed to tell the concrete text predicate
+// types apart here, so the per-document walk can distinguish them with a cheap
+// map lookup instead.
 // Results go into `resolved`, keyed on the base Predicate*; the per-document
 // walk then only does the cheap per-key term-frequency lookup. A leaf whose
 // term (and all its variants) is absent from the index resolves to empty
 // postings.
+
 void ResolveLeaves(const Predicate *predicate, uint32_t total_docs,
                    const indexes::scoring::Scorer *scorer,
                    ResolvedLeaves &resolved) {
@@ -1047,21 +1050,19 @@ void ResolveLeaves(const Predicate *predicate, uint32_t total_docs,
       // dynamic_cast exactly once here (once per query -- not in the
       // per-document ScoreNode path). Prefix/suffix/fuzzy resolve to their
       // expansion terms (scored one-term-not-sum); ScoreNode picks a single
-      // matched term per document. Infix is unimplemented, so an infix query
-      // aborts before scoring and never reaches this point. The three expansion
-      // kinds differ only in which words the pattern expands to, so they share
-      // one collector and one `max_words` bound.
+      // matched term per document. Infix is unimplemented
+      // (InfixPredicate::BuildTextIterator and ::Evaluate both CHECK(false)),
+      // so an infix query aborts before scoring and never reaches this point.
+      // The three expansion kinds differ only in which words the pattern
+      // expands to, so they share one collector and one `max_words` bound.
       const uint32_t max_words = options::GetMaxTermExpansions().GetValue();
       ResolvedLeaf expansion_leaf;
       auto add_expansion = [&](const indexes::text::Rax &tree,
                                absl::string_view pattern) {
         auto it = tree.GetWordIterator(pattern);
         for (uint32_t n = 0; !it.Done() && n < max_words; ++n, it.Next()) {
-          auto postings = it.GetPostingsTarget();
-          if (postings) {
-            AddExpansionTerm(std::move(postings), total_docs, scorer,
-                             expansion_leaf);
-          }
+          AddExpansionTerm(it.GetPostingsTarget(), total_docs, scorer,
+                           expansion_leaf);
         }
       };
       bool is_expansion = true;
@@ -1899,6 +1900,7 @@ void SearchResult::TrimResults(std::vector<T> &vec,
           if (a.score != b.score) {
             return a.score > b.score;
           }
+          // Tie-break on key ascending for a deterministic order.
           return a.external_id->Str() < b.external_id->Str();
         });
   }
@@ -2344,31 +2346,17 @@ absl::Status query::SearchParameters::PreParseQueryString() {
   VMSDK_LOG(DEBUG, nullptr)
       << "Query: '" << vmsdk::config::RedactIfNeeded(parse_vars.query_string)
       << "'";
-  // Split the query string into a pre-filter expression and a KNN vector
-  // filter at the "=>" delimiter.
-  //
-  // Strategy: parse the pre-filter portion of the expression to find where it
-  // ends, then check whether a "=>" KNN delimiter follows. This is safer than
-  // scanning the raw string for "=>" because "=>" also appears as a suffix
-  // query-attribute delimiter (e.g. "]=>{$yield_distance_as: ...}"), which is
-  // now consumed inside ParseVectorRangePredicate and will not be present in
-  // the top-level expression we receive here.
-  //
-  // FindVectorDelimiter() skips "=>" occurrences followed by '{' and finds the
-  // first "=>" followed by '[', which is the KNN boundary.
-  const absl::string_view::size_type delimiter_pos =
-      FindVectorDelimiter(filter_expression);
+  auto pos = FindVectorDelimiter(filter_expression);
   absl::string_view pre_filter;
   absl::string_view vector_filter;
   // If the delimiter is not found (ie - non vector query), treat the whole
   // string as pre-filter.
-  if (delimiter_pos == absl::string_view::npos) {
+  if (pos == absl::string_view::npos) {
     pre_filter = absl::StripAsciiWhitespace(filter_expression);
   } else {
-    pre_filter =
-        absl::StripAsciiWhitespace(filter_expression.substr(0, delimiter_pos));
-    vector_filter = absl::StripAsciiWhitespace(filter_expression.substr(
-        delimiter_pos + kVectorFilterDelimiter.size()));
+    pre_filter = absl::StripAsciiWhitespace(filter_expression.substr(0, pos));
+    vector_filter = absl::StripAsciiWhitespace(
+        filter_expression.substr(pos + kVectorFilterDelimiter.size()));
   }
   // If INORDER OR SLOP, but the index schema does not support offsets, we
   // reject the query.
@@ -2502,10 +2490,9 @@ absl::Status PostParseVectorParameters(query::SearchParameters &parameters) {
 
   if (!parameters.parse_vars.score_as_string.empty()) {
     VMSDK_ASSIGN_OR_RETURN(
-        parameters.parse_vars.score_as_string,
+        auto score_as_string,
         SubstituteParam(parameters, parameters.parse_vars.score_as_string));
-    parameters.score_as =
-        vmsdk::MakeUniqueValkeyString(parameters.parse_vars.score_as_string);
+    parameters.score_as = vmsdk::MakeUniqueValkeyString(score_as_string);
   }
   return absl::OkStatus();
 }
