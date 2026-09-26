@@ -234,16 +234,12 @@ query::EvaluationResult PrefilterEvaluator::EvaluateVectorRange(
   if (!vector_index) {
     return query::EvaluationResult(false);
   }
-  auto distance_result =
-      vector_index->ComputeDistanceFromRecord(*key_, query_vector);
-  if (!distance_result.ok()) {
+  auto within = vector_index->IsWithinVectorRange(
+      *key_, query_vector, static_cast<float>(predicate.GetRadius()));
+  if (!within.ok() || !within->has_value()) {
     return query::EvaluationResult(false);
   }
-  float distance = distance_result->first;
-  if (distance > static_cast<float>(predicate.GetRadius())) {
-    return query::EvaluationResult(false);
-  }
-  return query::EvaluationResult(true, distance);
+  return query::EvaluationResult(true, **within);
 }
 
 // ComputeDistanceFromRecord without query_magnitude — used by VR search path.

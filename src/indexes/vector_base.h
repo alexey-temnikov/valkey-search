@@ -334,18 +334,19 @@ class VectorBase : public IndexBase {
       absl::string_view query, float radius, cancel::Token &cancellation_token,
       std::unique_ptr<hnswlib::BaseFilterFunctor> filter = nullptr) = 0;
 
-  // Public because PrefilterEvaluator in search.cc / vector_base.cc calls this
-  // directly to compute a VR match distance.
-  // Returns the distance and internal label for the given key, or an error if
-  // the key is not tracked. Used by AddPrefilteredKey and PrefilterEvaluator.
-  // Prefer IsWithinVectorRange for callers that only need a pass/fail check.
+  // Returns the raw (unclamped) distance and internal label for the given key,
+  // or an error if the key is not tracked. Used by AddPrefilteredKey and by
+  // VectorFlat::SearchRange, which clamps it. Per-key VR radius checks must use
+  // IsWithinVectorRange, which applies the same cosine clamp.
   absl::StatusOr<std::pair<float, hnswlib::labeltype>>
   ComputeDistanceFromRecord(const InternedStringPtr &key,
                             absl::string_view query) const;
 
   // Returns the distance from the stored vector for `key` to `query` if the
   // distance is <= `radius`; returns std::nullopt if outside the radius;
-  // returns an error if the key is not tracked in this index.
+  // returns an error if the key is not tracked in this index. The distance is
+  // cosine-clamped exactly like SearchRange, so plain and compound VR queries
+  // agree on membership and on the reported distance.
   absl::StatusOr<std::optional<float>> IsWithinVectorRange(
       const InternedStringPtr &key, absl::string_view query,
       float radius) const {
@@ -353,7 +354,7 @@ class VectorBase : public IndexBase {
     if (!result.ok()) {
       return result.status();
     }
-    float distance = result->first;
+    float distance = ClampCosineDistance(result->first);
     if (distance > radius) {
       return std::nullopt;
     }
