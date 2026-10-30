@@ -2347,6 +2347,43 @@ TEST_F(ScoreTextQueryTestBase,
   EXPECT_FALSE(matches("d3", inorder));
 }
 
+// Companion / opposite direction of the leak test: the EXACT query word (not a
+// stem inflection) must still match at NOSTEM-field positions. The leak tests
+// only assert that NOSTEM positions are *rejected* for the stem root, so a fix
+// that over-restricts every retained map -- including the exact word's own
+// posting -- to the stemmed field mask passes all of them while wrongly dropping
+// body-only matches. On the same data, querying the exact word "runs fast" must
+// return d1 and d3 (exact phrase only in the NOSTEM body) as well as d2.
+TEST_F(ScoreTextQueryTestBase, ExactWordPositionsStayInNoStemField) {
+  auto schema = BuildTwoTextFieldSchema({
+      {"d1", "he runs", "runs fast"},
+      {"d2", "he runs fast", ""},
+      {"d3", "runs slow", "runs fast"},
+  });
+  const auto *scorer =
+      indexes::scoring::GetScorer(indexes::scoring::ScorerType::kBm25Std);
+  auto matches = [&](const std::string &key, const TextParsingOptions &opts) {
+    // The negated range makes the prefilter evaluate the text children.
+    const std::string filter = "-@rating:[500 600] (runs fast)";
+    auto parsed = FilterParser(*schema, filter, opts).Parse();
+    EXPECT_TRUE(parsed.ok()) << parsed.status();
+    query::QueryContext query_ctx(*schema, scorer);
+    indexes::PrefilterEvaluator evaluator(query_ctx, parsed->query_operations,
+                                          *schema);
+    vmsdk::ReaderMutexLock lock(&schema->GetTimeSlicedMutex());
+    return evaluator.Evaluate(*parsed->root_predicate,
+                              StringInternStore::Intern(key));
+  };
+  const TextParsingOptions slop0{.slop = 0};
+  const TextParsingOptions inorder{.inorder = true};
+  EXPECT_TRUE(matches("d1", slop0));
+  EXPECT_TRUE(matches("d1", inorder));
+  EXPECT_TRUE(matches("d2", slop0));
+  EXPECT_TRUE(matches("d2", inorder));
+  EXPECT_TRUE(matches("d3", slop0));
+  EXPECT_TRUE(matches("d3", inorder));
+}
+
 TEST_F(ScoreTextQueryTestBase, StemInflectionIteratorSkipsNoStemPositions) {
   auto schema = BuildTwoTextFieldSchema(
       {{"d1", "he runs", "runs fast"}, {"d2", "runs slow", "runs fast"}});
